@@ -21,7 +21,8 @@
 #include <string>
 
 namespace leveldb {
-
+// leveldb的数据块
+// 方便操作，直接使用，避免数据复制
 class Slice {
  public:
   // Create an empty slice.
