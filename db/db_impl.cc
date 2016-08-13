@@ -704,9 +704,10 @@ Status DBImpl::WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit,
 
     // want the data slammed to disk as fast as possible,
     //  no compression for level 0.
-    local_options=options_;
-    local_options.compression=kNoCompression;
-    local_options.block_size=current_block_size_;
+    local_options = options_;
+    local_options.compression = kNoCompression;
+    local_options.block_size = current_block_size_;
+    // 创建表
     s = BuildTable(dbname_, env_, local_options, user_comparator(), table_cache_, iter, &meta, smallest_snapshot);
 
     Log(options_.info_log, "Level-0 table #%llu: %llu bytes, %llu keys %s",
@@ -724,7 +725,9 @@ Status DBImpl::WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit,
   // Note that if file_size is zero, the file has been deleted and
   // should not be added to the manifest.
   int level = 0;
+  // 写入成功，开始更新manifest
   if (s.ok() && meta.file_size > 0) {
+    // 获取最大的key和最小的key
     const Slice min_user_key = meta.smallest.user_key();
     const Slice max_user_key = meta.largest.user_key();
     if (base != NULL) {
@@ -735,48 +738,53 @@ Status DBImpl::WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit,
             level_limit=config::kMaxMemCompactLevel;
 
         // remember, mutex is held so safe to push file into a non-compacting level
+        // 选择文件的level
         level = base->PickLevelForMemTableOutput(min_user_key, max_user_key, level_limit);
         if (versions_->IsCompactionSubmitted(level) || !versions_->NeighborCompactionsQuiet(level))
-            level=0;
-
-        if (0!=level)
+            level = 0;
+        // 如果不是level 0
+        if (0 != level)
         {
             Status move_s;
             std::string old_name, new_name;
 
-            old_name=TableFileName(options_, meta.number, 0);
-            new_name=TableFileName(options_, meta.number, level);
-            move_s=env_->RenameFile(old_name, new_name);
-
+            old_name = TableFileName(options_, meta.number, 0);
+            new_name = TableFileName(options_, meta.number, level);
+            // 我们进行文件移动
+            move_s = env_->RenameFile(old_name, new_name);
+            // 移动成功了
             if (move_s.ok())
             {
                 // builder already added file to table_cache with 2 references and
                 //  marked as level 0 (used by cache warming) ... going to remove from cache
                 //  and add again correctly
+                // 更新table_cache
                 table_cache_->Evict(meta.number, true);
-                meta.level=level;
+                meta.level = level;
 
                 // sadly, we must hold the mutex during this file open
                 //  since operating in non-overlapped level
-                Iterator* it=table_cache_->NewIterator(ReadOptions(),
+                Iterator* it = table_cache_->NewIterator(ReadOptions(),
                                                        meta.number,
                                                        meta.file_size,
                                                        meta.level);
                 delete it;
 
                 // argh!  logging while holding mutex ... cannot release
+                // 强制压缩到其它level
                 Log(options_.info_log, "Level-0 table #%llu:  moved to level %d",
                     (unsigned long long) meta.number,
                     level);
             }   // if
             else
             {
-                level=0;
+                level = 0;
             }   // else
         }   // if
     }
 
     if (s.ok())
+        // 在文件尾部添加相关信息
         edit->AddFile2(level, meta.number, meta.file_size,
                        meta.smallest, meta.largest,
                        meta.exp_write_low, meta.exp_write_high, meta.exp_explicit_high);
@@ -920,30 +928,30 @@ void DBImpl::MaybeScheduleCompaction() {
   }   // if
 }
 
-
+// 再另外的线程中进行工作
 void DBImpl::BackgroundCall2(
     Compaction * Compact) {
   MutexLock l(&mutex_);
   int level, type;
   assert(IsCompactionScheduled());
 
-  type=kNormalCompaction;
+  type = kNormalCompaction;
   ++running_compactions_;
-  if (NULL!=Compact)
-  {
-      level=Compact->level();
-      type=Compact->GetCompactionType();
+  if (NULL! = Compact)
+  {   // 更新压缩的级别和类型
+      level = Compact->level();
+      type = Compact->GetCompactionType();
   }   // if
-  else if (NULL!=manual_compaction_)
-      level=manual_compaction_->level;
+  else if (NULL != manual_compaction_)
+      level = manual_compaction_->level;
   else
-      level=0;
+      level = 0;
 
-  if (0==level)
+  if (0 == level)
       gPerfCounters->Inc(ePerfBGCompactLevel0);
   else
       gPerfCounters->Inc(ePerfBGNormal);
-
+  // 告诉版本集压缩正在进行中
   versions_->SetCompactionRunning(level);
 
   if (!shutting_down_.Acquire_Load()) {
@@ -952,6 +960,7 @@ void DBImpl::BackgroundCall2(
     switch(type)
     {
         case kNormalCompaction:
+            //进程常规压缩
             s = BackgroundCompaction(Compact);
             break;
 
@@ -1505,7 +1514,7 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   }
   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
 }
-
+// 进行压缩
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
 
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);

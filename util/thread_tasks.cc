@@ -29,12 +29,17 @@ namespace leveldb {
 void
 CompactionTask::operator()()
 {
+    // 调用相应的db的BackgroundCall2
+    // 进行后台压缩
     m_DBImpl->BackgroundCall2(m_Compaction);
-    m_Compaction=NULL;
+    m_Compaction = NULL;
 
     // look for grooming compactions in other databases.
     // MUST submit to different pool, or will seldom work.
-    if (0==gCompactionThreads->m_WorkQueueAtomic)
+    // 压缩线程没啥活可干了
+    // 直接让别的线程去扫描所有数据库
+    // 看看是不是哪个数据库可以压缩下
+    if (0 == gCompactionThreads->m_WorkQueueAtomic)
     {
         ThreadTask * task=new GroomingPollTask;
 
@@ -53,9 +58,9 @@ GroomingPollTask::operator()()
     // if there is no current backlog ... see if
     //  databases have grooming opportunity waiting
     // "false" only scan user databases, not internal
-    if (0==gCompactionThreads->m_WorkQueueAtomic)
+    if (0 == gCompactionThreads->m_WorkQueueAtomic)
         DBList()->ScanDBs(false, &DBImpl::CheckAvailableCompactions);
-    if (0==gCompactionThreads->m_WorkQueueAtomic)
+    if (0 == gCompactionThreads->m_WorkQueueAtomic)
         DBList()->ScanDBs(true, &DBImpl::CheckAvailableCompactions);
 
 }   // GroomingPollTask::operator()

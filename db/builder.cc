@@ -39,7 +39,7 @@ Status BuildTable(const std::string& dbname,
   std::string fname = TableFileName(options, meta->number, meta->level);
   if (iter->Valid()) {
     WritableFile* file;
-
+    // 创建新的科协文件
     s = env->NewWritableFile(fname, &file,
                                  env->RecoveryMmapSize(&options));
     if (!s.ok()) {
@@ -49,7 +49,7 @@ Status BuildTable(const std::string& dbname,
     // tune fadvise to keep all of this lower level file in page cache
     //  (compaction of unsorted files causes severe cache misses)
     file->SetMetadataOffset(1);
-
+    
     TableBuilder* builder = new TableBuilder(options, file);
     meta->smallest.DecodeFrom(iter->key());
     for (; iter->Valid(); iter->Next()) {
