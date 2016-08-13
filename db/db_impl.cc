@@ -204,7 +204,7 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
   has_imm_.Release_Store(NULL);
 
   table_cache_ = new TableCache(dbname_, &options_, file_cache(), double_cache);
-
+  // 版本集合
   versions_ = new VersionSet(dbname_, &options_, table_cache_,
                              &internal_comparator_);
 
@@ -803,6 +803,7 @@ Status DBImpl::CompactMemTable() {
   VersionEdit edit;
   Version* base = versions_->current();
   base->Ref();
+  // 将内存表直接写入level0
   Status s = WriteLevel0Table(imm_, &edit, base);
   base->Unref();
 
@@ -811,12 +812,13 @@ Status DBImpl::CompactMemTable() {
   }
 
   // Replace immutable memtable with the generated Table
+  // 写入成功了，升级日志版本
   if (s.ok()) {
     edit.SetPrevLogNumber(0);
     edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
     s = versions_->LogAndApply(&edit, &mutex_);
   }
-
+  // 写入成功，释放imm，并删除所有的过期文件
   if (s.ok()) {
     // Commit to the new state
     imm_->Unref();
@@ -901,7 +903,7 @@ void DBImpl::MaybeScheduleCompaction() {
 
   if (!shutting_down_.Acquire_Load())
   {
-      if (NULL==manual_compaction_)
+      if (NULL == manual_compaction_)
       {
           // ask versions_ to schedule work to hot threads
           versions_->PickCompaction(this);
@@ -911,7 +913,7 @@ void DBImpl::MaybeScheduleCompaction() {
       {
           // support manual compaction under hot threads
           versions_->SetCompactionSubmitted(manual_compaction_->level);
-          ThreadTask * task=new CompactionTask(this, NULL);
+          ThreadTask * task = new CompactionTask(this, NULL);
           gCompactionThreads->Submit(task, true);
       }   // else if
   }   // if
@@ -990,7 +992,8 @@ void DBImpl::BackgroundCall2(
 
 }
 
-
+// 在另一个线程中了
+// 不是写入线程
 void
 DBImpl::BackgroundImmCompactCall() {
   MutexLock l(&mutex_);
@@ -1001,12 +1004,14 @@ DBImpl::BackgroundImmCompactCall() {
   gPerfCounters->Inc(ePerfBGCompactImm);
 
   if (!shutting_down_.Acquire_Load()) {
+    // 压缩内存表
     s = CompactMemTable();
     if (!s.ok() && !shutting_down_.Acquire_Load()) {
       // Wait a little bit before retrying background compaction in
       // case this is an environmental problem and we do not want to
       // chew up resources for failed compactions for the duration of
       // the problem.
+      // 让所有的等待者全都被唤醒
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
       mutex_.Unlock();
       Log(options_.info_log, "Waiting after background imm compaction error: %s",
@@ -1027,7 +1032,8 @@ DBImpl::BackgroundImmCompactCall() {
   if (shutting_down_.Acquire_Load()) {
 
     // must abandon data in memory ... hope recovery log works
-    if (NULL!=imm_)
+    // 此处存在挂数据的危险
+    if (NULL != imm_)
       imm_->Unref();
     imm_ = NULL;
     has_imm_.Release_Store(NULL);
@@ -1036,6 +1042,7 @@ DBImpl::BackgroundImmCompactCall() {
   // retry imm compaction if failed and not shutting down
   else if (!s.ok())
   {
+      // 重试该任务
       ThreadTask * task=new ImmWriteTask(this);
       gImmThreads->Submit(task, true);
   }   // else
@@ -1717,13 +1724,16 @@ Status DBImpl::Get(const ReadOptions& options,
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(key, snapshot, meta);
+    //直接内存命中
     if (mem->Get(lkey, value, &s, &options_)) {
       // Done
         gPerfCounters->Inc(ePerfGetMem);
+    // 直接不变内存命中
     } else if (imm != NULL && ((MemTable *)imm)->Get(lkey, value, &s, &options_)) {
       // Done
         gPerfCounters->Inc(ePerfGetImm);
     } else {
+      // 从文件中获取
       s = current->Get(options, lkey, value, &stats);
       have_stat_update = true;
       gPerfCounters->Inc(ePerfGetVersion);
@@ -1777,7 +1787,7 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   Status status;
   int throttle(0);
-
+  // 创建writer
   Writer w(&mutex_);
   w.batch = my_batch;
   w.sync = options.sync;
@@ -1786,16 +1796,21 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   {  // place mutex_ within a block
      //  not changing tabs to ease compare to Google sources
   MutexLock l(&mutex_);
+  // 将writer推入writers中
   writers_.push_back(&w);
+  //  等待前面的写入完成
   while (!w.done && &w != writers_.front()) {
+    // 等待条件变量
     w.cv.Wait();
   }
+  // 写入完成了
   if (w.done) {
     return w.status;  // skips throttle ... maintenance unfriendly coding, bastards
   }
-
+  // 写入没有完成
   // May temporarily unlock and wait.
   status = MakeRoomForWrite(my_batch == NULL);
+  // 获取ID
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && my_batch != NULL) {  // NULL batch is for compactions
@@ -1809,6 +1824,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
     // into mem_.
     {
       mutex_.Unlock();
+      // 写入日志
       status = log_->AddRecord(WriteBatchInternal::Contents(updates));
       if (status.ok() && options.sync) {
         status = logfile_->Sync();
@@ -1825,17 +1841,21 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
 
   while (true) {
     Writer* ready = writers_.front();
+    // 将自己从写队列最前端移动走
     writers_.pop_front();
     if (ready != &w) {
       ready->status = status;
       ready->done = true;
       ready->cv.Signal();
     }
+    // 结束执行
     if (ready == last_writer) break;
   }
 
   // Notify new head of write queue
+  // 如果队列不空
   if (!writers_.empty()) {
+    // 那么需要激活下一个写操作
     writers_.front()->cv.Signal();
   }
 
@@ -1963,41 +1983,50 @@ Status DBImpl::MakeRoomForWrite(bool force) {
   Status s;
 
   // hint to background compaction.
-  level0_good=(versions_->NumLevelFiles(0) < (int)config::kL0_CompactionTrigger);
+  // 是否需要对level0进行压缩
+  level0_good = (versions_->NumLevelFiles(0) < (int)config::kL0_CompactionTrigger);
 
   while (true) {
     if (!bg_error_.ok()) {
       // Yield previous error
-        gPerfCounters->Inc(ePerfWriteError);
+      // 之前发生了错误
+      // 我们需要从错误中返回
+      gPerfCounters->Inc(ePerfWriteError);
       s = bg_error_;
       break;
     } else if (
         allow_delay &&
         versions_->NumLevelFiles(0) >= (int)config::kL0_SlowdownWritesTrigger) {
+      // 此时level0已经需要进行压缩了
       // We are getting close to hitting a hard limit on the number of
       // L0 files.  Rather than delaying a single write by several
       // seconds when we hit the hard limit, start delaying each
       // individual write by 1ms to reduce latency variance.  Also,
       // this delay hands over some CPU to the compaction thread in
       // case it is sharing the same core as the writer.
+      // 解开锁
       mutex_.Unlock();
 #if 0   // see if this impacts smoothing or helps (but keep the counts)
       // (original Google code left for reference)
       env_->SleepForMicroseconds(1000);
 #endif
+      // 不再进行delay了
       allow_delay = false;  // Do not delay a single write more than once
       gPerfCounters->Inc(ePerfWriteSleep);
       mutex_.Lock();
     } else if (!force &&
                (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
       // There is room in current memtable
+      // 内存表有空间
         gPerfCounters->Inc(ePerfWriteNoWait);
       break;
     } else if (imm_ != NULL) {
       // We have filled up the current memtable, but the previous
       // one is still being compacted, so we wait.
+      // 内存表还在进行压缩中
       Log(options_.info_log, "waiting 2...\n");
       gPerfCounters->Inc(ePerfWriteWaitImm);
+      // 可能需要进行压缩
       MaybeScheduleCompaction();
       if (!shutting_down_.Acquire_Load())
           bg_cv_.Wait();
@@ -2006,6 +2035,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // There are too many level-0 files.
       Log(options_.info_log, "waiting...\n");
       gPerfCounters->Inc(ePerfWriteWaitLevel0);
+      // level0文件太多，需要进行压缩
       MaybeScheduleCompaction();
       if (!shutting_down_.Acquire_Load())
           bg_cv_.Wait();
@@ -2013,24 +2043,30 @@ Status DBImpl::MakeRoomForWrite(bool force) {
     } else {
       // Attempt to switch to a new memtable and trigger compaction of old
       assert(versions_->PrevLogNumber() == 0);
+      // 得到新的日志文件号
       uint64_t new_log_number = versions_->NewFileNumber();
 
       gPerfCounters->Inc(ePerfWriteNewMem);
+      // 创建新日志文件
       s = NewRecoveryLog(new_log_number);
 
       if (!s.ok()) {
         // Avoid chewing through file number space in a tight loop.
+        // 如果没创建成功，则利用现有的
         versions_->ReuseFileNumber(new_log_number);
         break;
       }
-
+      // 将当前内存表变为以前的内存表
       imm_ = mem_;
       has_imm_.Release_Store((MemTable*)imm_);
-      if (NULL!=imm_)
+      if (NULL != imm_)
       {
-         ThreadTask * task=new ImmWriteTask(this);
+        // 创建异步任务
+         ThreadTask * task = new ImmWriteTask(this);
          gImmThreads->Submit(task, true);
       }
+      // 创建全新的内存表
+      // 再次进入循环的时候，就可以跳出了
       mem_ = new MemTable(internal_comparator_);
       mem_->Ref();
       force = false;   // Do not force another compaction if have room
@@ -2180,7 +2216,9 @@ void DBImpl::GetApproximateSizes(
 // can call if they wish
 Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value,
   const KeyMetaData * meta) {
+  // 创建WriteBatch类
   WriteBatch batch;
+  // 放入key,value和元信息
   batch.Put(key, value, meta);
   return Write(opt, &batch);
 }
@@ -2201,8 +2239,9 @@ DB::~DB() { }
 Status DB::Open(const Options& options, const std::string& dbname,
                 DB** dbptr) {
   *dbptr = NULL;
-
+  // 创见全新的DB实现类
   DBImpl* impl = new DBImpl(options, dbname);
+  // 上锁
   impl->mutex_.Lock();
   VersionEdit edit;
   Status s;
@@ -2215,28 +2254,36 @@ Status DB::Open(const Options& options, const std::string& dbname,
   //  ... this value is AFTER write_buffer and 40M for recovery log and LOG
   //if (!options.limited_developer_mem && impl->GetCacheCapacity() < flex::kMinimumDBMemory)
   //    s=Status::InvalidArgument("Less than 10Mbytes per database/vnode");
-
+  // 恢复过程
+  // 创建消失的文件等
   if (s.ok())
       s = impl->Recover(&edit); // Handles create_if_missing, error_if_exists
-
+  // 创建全新的日志ID
   if (s.ok()) {
     uint64_t new_log_number = impl->versions_->NewFileNumber();
-
+    // 创建全新的恢复日志
     s = impl->NewRecoveryLog(new_log_number);
 
     if (s.ok()) {
+      // 设置日志版本号
+      // edit是修改版本号的结构，通过edit来修改版本集
       edit.SetLogNumber(new_log_number);
       s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
     }
     if (s.ok()) {
+      // 清理老旧文件
       impl->DeleteObsoleteFiles();
+      // 检查压缩状态
+      // 必要的时候，进行压缩
       impl->CheckCompactionState();
     }
   }
 
   if (impl->options_.cache_object_warming)
+      // 预热，将一些表预先加载到内存
       impl->table_cache_->PreloadTableCache();
-
+  // 解锁
+  // 完成db文件的打开
   impl->mutex_.Unlock();
   if (s.ok()) {
     *dbptr = impl;

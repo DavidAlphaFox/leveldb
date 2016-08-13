@@ -499,7 +499,8 @@ class PosixMmapFile : public WritableFile {
 //  same process.  It does not with NFS until Linux 2.6.12 ... other OS may vary.
 //  SmartOS/Solaris do not appear to support flock() though there is a man page.
 // Pick the fcntl() or flock() below as appropriate for your environment / needs.
-
+// riak的优化，此处可以看出，fcntl是只排斥外部进程，flock是内部和外部进程都排斥的
+// 因此之前先插入全局的锁定表是一个非常重要的事情
 static int LockOrUnlock(int fd, bool lock) {
 #ifndef LOCK_UN
     // works with NFS, but fails if same process attempts second access to
@@ -712,10 +713,12 @@ class PosixEnv : public Env {
   virtual Status LockFile(const std::string& fname, FileLock** lock) {
     *lock = NULL;
     Status result;
+    //  打开锁文件
     int fd = open(fname.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
       result = IOError(fname, errno);
     } else if (!gFileLocks.Insert(fname)) {
+      // 无法将锁文件加入全局的表中
       close(fd);
       result = Status::IOError("lock " + fname, "already held by process");
     } else if (LockOrUnlock(fd, true) == -1) {
@@ -723,10 +726,11 @@ class PosixEnv : public Env {
       close(fd);
       gFileLocks.Remove(fname);
     } else {
+      // 成功锁住
       PosixFileLock* my_lock = new PosixFileLock;
       my_lock->fd_ = fd;
       my_lock->name_ = fname;
-
+      // 将锁交给上层结构
       *lock = my_lock;
     }
     return result;
@@ -1048,23 +1052,24 @@ static Env* default_env;
 static volatile bool started=false;
 static void InitDefaultEnv()
 {
-    default_env=new PosixEnv;
+    default_env = new PosixEnv;
 
     ThrottleInit();
 
     // force the loading of code for both filters in case they
     //  are hidden in a shared library
     const FilterPolicy * ptr;
-    ptr=NewBloomFilterPolicy(16);
+    // 强制性加载bloom策略
+    ptr = NewBloomFilterPolicy(16);
     delete ptr;
-    ptr=NewBloomFilterPolicy2(16);
+    ptr = NewBloomFilterPolicy2(16);
     delete ptr;
-
+    // 使用SSE4.2来加速CRC32
     if (HasSSE4_2())
         crc32c::SwitchToHardwareCRC();
 
     PerformanceCounters::Init(false);
-
+    // 初始化主要的线程池
     gImmThreads=new HotThreadPool(5, "ImmWrite",
                                   ePerfBGImmDirect, ePerfBGImmQueued,
                                   ePerfBGImmDequeued, ePerfBGImmWeighted);
@@ -1080,10 +1085,11 @@ static void InitDefaultEnv()
                                          ePerfBGCompactDirect, ePerfBGCompactQueued,
                                          ePerfBGCompactDequeued, ePerfBGCompactWeighted, 2);
 
-    started=true;
+    started = true;
 }
 
 Env* Env::Default() {
+  //使用pthread的tls来初始化Env
   pthread_once(&once, InitDefaultEnv);
   return default_env;
 }

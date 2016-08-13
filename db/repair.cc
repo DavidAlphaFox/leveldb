@@ -87,16 +87,20 @@ class Repairer {
 
   Status Run() {
     Status status;
-
+    // 锁定db
     status = env_->LockFile(LockFileName(dbname_), &db_lock_);
-
+    // 成功锁定后
     if (status.ok())
+      // 创见层级文件
         status = MakeLevelDirectories(env_, options_);
 
     if (status.ok()) {
+      // 寻找所有的文件
       status = FindFiles();
       if (status.ok()) {
+          // 将日志文件转化成表
           ConvertLogFilesToTables();
+          // 提取元数据
           ExtractMetaData();
           status = WriteDescriptor();
       }
@@ -127,6 +131,7 @@ class Repairer {
             static_cast<int>(files),
             bytes);
       }
+      // 解锁db文件
       if (db_lock_ != NULL) {
         env_->UnlockFile(db_lock_);
       }
@@ -134,17 +139,18 @@ class Repairer {
 
     // perform Riak specific scan for overlapping .sst files
     //  within a level
+    // riak的优化
     if (status.ok())
     {
         leveldb::DB * db_ptr;
         Options options;
 
-        db_ptr=NULL;
-        options=org_options_;
+        db_ptr = NULL;
+        options = org_options_;
 //        options.block_cache=NULL;  // not reusing for fear of edge cases
-        options.is_repair=true;
-        options.error_if_exists=false;
-        status=leveldb::DB::Open(options, org_dbname_, &db_ptr);
+        options.is_repair = true;
+        options.error_if_exists = false;
+        status = leveldb::DB::Open(options, org_dbname_, &db_ptr);
 
         if (status.ok())
             status=db_ptr->VerifyLevels();

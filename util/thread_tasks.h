@@ -71,7 +71,7 @@ class ThreadTask : public RefObjectBase
 /**
  * Background write of imm buffer to Level-0 file
  */
-
+// 给某个db进行压缩
 class ImmWriteTask : public ThreadTask
 {
 protected:

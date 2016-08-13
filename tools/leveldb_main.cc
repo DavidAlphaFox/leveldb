@@ -220,6 +220,7 @@ static void Usage() {
 }
 
 int main(int argc, char** argv) {
+  // 得到leveldb的环境
   leveldb::Env* env = leveldb::Env::Default();
   bool ok = true;
   if (argc < 2) {
