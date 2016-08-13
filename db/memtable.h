@@ -77,7 +77,7 @@ class MemTable {
   };
   friend class MemTableIterator;
   friend class MemTableBackwardIterator; // does not exist
-
+  // 使用跳表作为内存表
   typedef SkipList<const char*, KeyComparator> Table;
 
   KeyComparator comparator_;

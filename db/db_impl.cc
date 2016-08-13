@@ -681,6 +681,7 @@ Status DBImpl::WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit,
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
+  // 创建新的meta信息
   meta.number = versions_->NewFileNumber();
   meta.level = 0;
   pending_outputs_.insert(meta.number);
