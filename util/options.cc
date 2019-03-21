@@ -60,7 +60,7 @@ void
 Options::Dump(
     Logger * log) const
 {
-    Log(log,"                       Version: %s", STR(LEVELDB_VSN));
+    Log(log,"                       Version: %s %s", STR(LEVELDB_VSN), CompileOptionsString());
     Log(log,"            Options.comparator: %s", comparator->Name());
     Log(log,"     Options.create_if_missing: %d", create_if_missing);
     Log(log,"       Options.error_if_exists: %d", error_if_exists);
@@ -89,6 +89,7 @@ Options::Dump(
     Log(log,"    Options.tiered_slow_prefix: %s", tiered_slow_prefix.c_str());
     Log(log,"                        crc32c: %s", crc32c::IsHardwareCRC() ? "hardware" : "software");
     Log(log,"  Options.cache_object_warming: %s", cache_object_warming ? "true" : "false");
+    Log(log,"       Options.ExpiryActivated: %s", ExpiryActivated() ? "true" : "false");
 
     if (NULL!=expiry_module.get())
         expiry_module->Dump(log);

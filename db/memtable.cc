@@ -85,7 +85,7 @@ Iterator* MemTable::NewIterator() {
 void MemTable::Add(SequenceNumber s, ValueType type,
                    const Slice& key,
                    const Slice& value,
-                   const ExpiryTime & expiry) {
+                   const ExpiryTimeMicros & expiry) {
   // Format of an entry is concatenation of:
   //  key_size     : varint32 of internal_key.size()
   //  key bytes    : char[internal_key.size()]
@@ -149,7 +149,7 @@ bool MemTable::Get(const LookupKey& key, Value* value, Status* s,
         case kTypeValueExplicitExpiry:
         {
             bool expired=false;
-            if (NULL!=options && NULL!=options->expiry_module.get())
+            if (NULL!=options && options->ExpiryActivated())
                 expired=options->expiry_module->MemTableCallback(internal_key);
             if (expired)
             {

@@ -76,7 +76,7 @@ struct DBImpl::CompactionState {
     InternalKey smallest, largest;
     uint64_t exp_write_low, exp_write_high, exp_explicit_high;
 
-    Output() : number(0), file_size(0), exp_write_low(ULONG_MAX), exp_write_high(0), exp_explicit_high(0) {}
+    Output() : number(0), file_size(0), exp_write_low(ULLONG_MAX), exp_write_high(0), exp_explicit_high(0) {}
   };
   std::vector<Output> outputs;
 
@@ -168,6 +168,8 @@ Options SanitizeOptions(const std::string& dbname,
   // remove anything expiry if this is an internal database
   if (result.is_internal_db)
       result.expiry_module.reset();
+  else if (NULL!=result.expiry_module.get())
+      result.expiry_module.get()->NoteUserExpirySettings();
 
   return result;
 }
@@ -193,10 +195,10 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
       log_(NULL),
       tmp_batch_(new WriteBatch),
       manual_compaction_(NULL),
-      level0_good(true),
       throttle_end(0),
       running_compactions_(0),
-      block_size_changed_(0), last_low_mem_(0)
+      block_size_changed_(0), last_low_mem_(0),
+      hotbackup_pending_(false)
 {
   current_block_size_=options_.block_size;
 
@@ -272,7 +274,7 @@ Status DBImpl::NewDB() {
   {
     log::Writer log(file);
     std::string record;
-    new_db.EncodeTo(&record);
+    new_db.EncodeTo(&record, options_.ExpiryActivated());
     s = log.AddRecord(record);
     if (s.ok()) {
       s = file->Close();
@@ -372,6 +374,7 @@ DBImpl::KeepOrDelete(
           case kCurrentFile:
           case kDBLockFile:
           case kInfoLogFile:
+          case kCacheWarming:
               keep = true;
               break;
       }   // switch
@@ -704,10 +707,10 @@ Status DBImpl::WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit,
 
     // want the data slammed to disk as fast as possible,
     //  no compression for level 0.
-    local_options = options_;
-    local_options.compression = kNoCompression;
-    local_options.block_size = current_block_size_;
-    // 创建表
+
+    local_options=options_;
+    // matthewv Nov 2, 2016 local_options.compression=kNoCompression;
+    local_options.block_size=current_block_size_;
     s = BuildTable(dbname_, env_, local_options, user_comparator(), table_cache_, iter, &meta, smallest_snapshot);
 
     Log(options_.info_log, "Level-0 table #%llu: %llu bytes, %llu keys %s",
@@ -850,7 +853,7 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
       }
     }
   }
-  TEST_CompactMemTable(); // TODO(sanjay): Skip if memtable does not overlap
+  CompactMemTableSynchronous(); // TODO(sanjay): Skip if memtable does not overlap
   for (int level = 0; level < max_level_with_files; level++) {
     TEST_CompactRange(level, begin, end);
   }
@@ -891,7 +894,17 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,const Slice* end) {
   }
 }
 
+/**
+ * This "test" routine was used in one production location,
+ *  then two with addition of hot backup.  Inappropriate for
+ *  TEST_ prefix if used in production.
+ */
 Status DBImpl::TEST_CompactMemTable() {
+    return(CompactMemTableSynchronous());
+}   // TEST_CompactMemTable
+
+
+Status DBImpl::CompactMemTableSynchronous() {
   // NULL batch means just wait for earlier writes to be done
   Status s = Write(WriteOptions(), NULL);
   if (s.ok()) {
@@ -1471,12 +1484,21 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
+    Table * table_ptr;
     Iterator* iter = table_cache_->NewIterator(ReadOptions(),
                                                output_number,
                                                current_bytes,
-                                               compact->compaction->level()+1);
+                                               compact->compaction->level()+1,
+                                               &table_ptr);
     s = iter->status();
+    // Riak specific: bloom filter is no longer read by default,
+    //  force read on highly used overlapped table files
+    if (s.ok() && VersionSet::IsLevelOverlapped(compact->compaction->level()+1))
+        table_ptr->ReadFilter();
+
+    // table_ptr invalidated by this delete
     delete iter;
+
     if (s.ok()) {
       Log(options_.info_log,
           "Generated table #%llu: %lld keys, %lld bytes",
@@ -1772,7 +1794,8 @@ Iterator* DBImpl::NewIterator(const ReadOptions& options) {
       &dbname_, env_, user_comparator(), internal_iter,
       (options.snapshot != NULL
        ? reinterpret_cast<const SnapshotImpl*>(options.snapshot)->number_
-       : latest_snapshot));
+       : latest_snapshot),
+      options_.expiry_module.get());
 }
 
 const Snapshot* DBImpl::GetSnapshot() {
@@ -1992,10 +2015,6 @@ Status DBImpl::MakeRoomForWrite(bool force) {
   bool allow_delay = !force;
   Status s;
 
-  // hint to background compaction.
-  // 是否需要对level0进行压缩
-  level0_good = (versions_->NumLevelFiles(0) < (int)config::kL0_CompactionTrigger);
-
   while (true) {
     if (!bg_error_.ok()) {
       // Yield previous error
@@ -2079,12 +2098,14 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // 再次进入循环的时候，就可以跳出了
       mem_ = new MemTable(internal_comparator_);
       mem_->Ref();
+
       force = false;   // Do not force another compaction if have room
       MaybeScheduleCompaction();
     }
   }
   return s;
 }
+
 
 // the following steps existed in two places, DB::Open() and
 //  DBImpl::MakeRoomForWrite().  This lead to a bug in Basho's
@@ -2445,7 +2466,7 @@ DBImpl::IsCompactionScheduled()
     bool flag(false);
     for (int level=0; level< config::kNumLevels && !flag; ++level)
         flag=versions_->IsCompactionSubmitted(level);
-    return(flag || NULL!=imm_);
+    return(flag || NULL!=imm_ || hotbackup_pending_);
 }   // DBImpl::IsCompactionScheduled
 
 }  // namespace leveldb

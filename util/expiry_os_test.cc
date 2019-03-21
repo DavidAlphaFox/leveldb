@@ -2,7 +2,7 @@
 //
 // expiry_os_tests.cc
 //
-// Copyright (c) 2016 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2016-2017 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -22,6 +22,8 @@
 
 #include <limits.h>
 #include <algorithm>
+#include <memory>
+#include <string>
 
 #include "util/testharness.h"
 #include "util/testutil.h"
@@ -31,13 +33,13 @@
 #include "leveldb/options.h"
 #include "leveldb/slice.h"
 #include "leveldb/write_batch.h"
-#include "leveldb_os/expiry_os.h"
 
 #include "db/db_impl.h"
 #include "db/dbformat.h"
 #include "db/filename.h"
 #include "db/version_set.h"
 #include "port/port.h"
+#include "util/expiry_os.h"
 #include "util/mutexlock.h"
 #include "util/throttle.h"
 
@@ -80,9 +82,11 @@ TEST(ExpiryTester, Defaults)
 {
     ExpiryModuleOS expiry;
 
-    ASSERT_EQ(expiry.expiry_enabled, false);
-    ASSERT_EQ(expiry.expiry_minutes, 0);
-    ASSERT_EQ(expiry.whole_file_expiry, false);
+    ASSERT_EQ(expiry.IsExpiryEnabled(), false);
+    ASSERT_EQ(expiry.GetExpiryMinutes(), 0);
+    ASSERT_EQ(expiry.IsExpiryUnlimited(), false);
+    ASSERT_EQ(expiry.IsWholeFileExpiryEnabled(), false);
+    ASSERT_EQ(expiry.ExpiryActivated(), false);
 
 }   // test Defaults
 
@@ -96,11 +100,12 @@ TEST(ExpiryTester, MemTableInserterCallback)
     uint64_t before, after;
     ExpiryModuleOS module;
     ValueType type;
-    ExpiryTime expiry;
+    ExpiryTimeMicros expiry;
     Slice key, value;
 
-    module.expiry_enabled=true;
-    module.whole_file_expiry=true;
+    module.SetExpiryEnabled(true);
+    module.SetWholeFileExpiryEnabled(true);
+    ASSERT_EQ(module.ExpiryActivated(), true);
 
     // deletion, do nothing
     type=kTypeDeletion;
@@ -113,11 +118,23 @@ TEST(ExpiryTester, MemTableInserterCallback)
     // plain value, needs expiry
     type=kTypeValue;
     expiry=0;
-    module.expiry_minutes=30;
-    before=port::TimeUint64();
-    SetTimeMinutes(before);
+    module.SetExpiryMinutes(30);
+    before=port::TimeMicros();
+    SetCachedTimeMicros(before);
     flag=module.MemTableInserterCallback(key, value, type, expiry);
-    after=port::TimeUint64();
+    after=port::TimeMicros();
+    ASSERT_EQ(flag, true);
+    ASSERT_EQ(type, kTypeValueWriteTime);
+    ASSERT_TRUE(before <= expiry && expiry <=after && 0!=expiry);
+
+    // plain value, needs expiry
+    type=kTypeValue;
+    expiry=0;
+    module.SetExpiryUnlimited(true);
+    before=port::TimeMicros();
+    SetCachedTimeMicros(before);
+    flag=module.MemTableInserterCallback(key, value, type, expiry);
+    after=port::TimeMicros();
     ASSERT_EQ(flag, true);
     ASSERT_EQ(type, kTypeValueWriteTime);
     ASSERT_TRUE(before <= expiry && expiry <=after && 0!=expiry);
@@ -125,11 +142,11 @@ TEST(ExpiryTester, MemTableInserterCallback)
     // plain value, expiry disabled
     type=kTypeValue;
     expiry=0;
-    module.expiry_minutes=0;
-    before=port::TimeUint64();
-    SetTimeMinutes(before);
+    module.SetExpiryMinutes(0);
+    before=port::TimeMicros();
+    SetCachedTimeMicros(before);
     flag=module.MemTableInserterCallback(key, value, type, expiry);
-    after=port::TimeUint64();
+    after=port::TimeMicros();
     ASSERT_EQ(flag, true);
     ASSERT_EQ(type, kTypeValue);
     ASSERT_EQ(expiry, 0);
@@ -137,23 +154,23 @@ TEST(ExpiryTester, MemTableInserterCallback)
     // write time value, needs expiry
     type=kTypeValueWriteTime;
     expiry=0;
-    module.expiry_minutes=30;
-    before=port::TimeUint64();
-    SetTimeMinutes(before);
+    module.SetExpiryMinutes(30);
+    before=port::TimeMicros();
+    SetCachedTimeMicros(before);
     flag=module.MemTableInserterCallback(key, value, type, expiry);
-    after=port::TimeUint64();
+    after=port::TimeMicros();
     ASSERT_EQ(flag, true);
     ASSERT_EQ(type, kTypeValueWriteTime);
     ASSERT_TRUE(before <= expiry && expiry <=after && 0!=expiry);
 
     // write time value, expiry supplied (as if copied from another db)
     type=kTypeValueWriteTime;
-    module.expiry_minutes=30;
-    before=port::TimeUint64();
+    module.SetExpiryMinutes(30);
+    before=port::TimeMicros();
     expiry=before - 1000;
-    SetTimeMinutes(before);
+    SetCachedTimeMicros(before);
     flag=module.MemTableInserterCallback(key, value, type, expiry);
-    after=port::TimeUint64();
+    after=port::TimeMicros();
     ASSERT_EQ(flag, true);
     ASSERT_EQ(type, kTypeValueWriteTime);
     ASSERT_TRUE((before - 1000) == expiry && expiry <=after && 0!=expiry);
@@ -161,7 +178,7 @@ TEST(ExpiryTester, MemTableInserterCallback)
     // explicit expiry, not changed
     type=kTypeValueExplicitExpiry;
     expiry=97531;
-    module.expiry_minutes=30;
+    module.SetExpiryMinutes(30);
     flag=module.MemTableInserterCallback(key, value, type, expiry);
     ASSERT_EQ(flag, true);
     ASSERT_EQ(type, kTypeValueExplicitExpiry);
@@ -180,15 +197,17 @@ TEST(ExpiryTester, MemTableCallback)
     uint64_t before, after;
     ExpiryModuleOS module;
     ValueType type;
-    ExpiryTime expiry;
+    ExpiryTimeMicros expiry;
     Slice key, value;
 
-    module.expiry_enabled=true;
-    module.whole_file_expiry=true;
-    module.expiry_minutes=5;
+    ASSERT_EQ(module.ExpiryActivated(), false);
+    module.SetExpiryEnabled(true);
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(5);
+    ASSERT_EQ(module.ExpiryActivated(), true);
 
-    before=port::TimeUint64();
-    SetTimeMinutes(before);
+    before=port::TimeMicros();
+    SetCachedTimeMicros(before);
 
     // deletion, do nothing
     InternalKey key1("DeleteMeKey", 0, 0, kTypeDeletion);
@@ -201,35 +220,43 @@ TEST(ExpiryTester, MemTableCallback)
     ASSERT_EQ(flag, false);
 
     // explicit, but time in the future
-    after=GetTimeMinutes() + 60*port::UINT64_ONE_SECOND;
+    after=GetCachedTimeMicros() + 60*port::UINT64_ONE_SECOND_MICROS;
     InternalKey key3("ExplicitKey", after, 0, kTypeValueExplicitExpiry);
     flag=module.MemTableCallback(key3.internal_key());
     ASSERT_EQ(flag, false);
     // advance the clock
-    SetTimeMinutes(after + 60*port::UINT64_ONE_SECOND);
+    SetCachedTimeMicros(after + 60*port::UINT64_ONE_SECOND_MICROS);
     flag=module.MemTableCallback(key3.internal_key());
     ASSERT_EQ(flag, true);
     // disable expiry
-    module.expiry_enabled=false;
+    module.SetExpiryEnabled(false);
+    ASSERT_EQ(module.ExpiryActivated(), false);
+
     flag=module.MemTableCallback(key3.internal_key());
     ASSERT_EQ(flag, false);
 
     // age expiry
-    module.expiry_enabled=true;
-    module.expiry_minutes=2;
-    after=GetTimeMinutes();
+    module.SetExpiryEnabled(true);
+    ASSERT_EQ(module.ExpiryActivated(), true);
+    module.SetExpiryMinutes(2);
+    after=GetCachedTimeMicros();
     InternalKey key4("AgeKey", after, 0, kTypeValueWriteTime);
     flag=module.MemTableCallback(key4.internal_key());
     ASSERT_EQ(flag, false);
     // advance the clock
-    SetTimeMinutes(after + 60*port::UINT64_ONE_SECOND);
+    SetCachedTimeMicros(after + 60*port::UINT64_ONE_SECOND_MICROS);
     flag=module.MemTableCallback(key4.internal_key());
     ASSERT_EQ(flag, false);
-    SetTimeMinutes(after + 120*port::UINT64_ONE_SECOND);
+    SetCachedTimeMicros(after + 120*port::UINT64_ONE_SECOND_MICROS);
     flag=module.MemTableCallback(key4.internal_key());
     ASSERT_EQ(flag, true);
     // disable expiry
-    module.expiry_enabled=false;
+    module.SetExpiryEnabled(false);
+    flag=module.MemTableCallback(key4.internal_key());
+    ASSERT_EQ(flag, false);
+    // switch to unlimited
+    module.SetExpiryEnabled(true);
+    module.SetExpiryUnlimited(true);
     flag=module.MemTableCallback(key4.internal_key());
     ASSERT_EQ(flag, false);
 
@@ -270,13 +297,15 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     VersionTester ver;
     int level;
 
-    module.expiry_enabled=true;
-    module.whole_file_expiry=true;
-    module.expiry_minutes=5;
+    ASSERT_EQ(ver.m_Options.ExpiryActivated(), false);
+
+    module.SetExpiryEnabled(true);
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(5);
     level=config::kNumOverlapLevels;
 
-    now=port::TimeUint64();
-    SetTimeMinutes(now);
+    now=port::TimeMicros();
+    SetCachedTimeMicros(now);
 
     // put two files into the level, no expiry
     file_ptr=new FileMetaData;
@@ -290,9 +319,9 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     files.push_back(file_ptr);
 
     // disable
-    module.expiry_enabled=false;
-    module.whole_file_expiry=false;
-    module.expiry_minutes=0;
+    module.SetExpiryEnabled(false);
+    module.SetWholeFileExpiryEnabled(false);
+    module.SetExpiryMinutes(0);
     ver.SetFileList(level, files);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
@@ -300,10 +329,10 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     ASSERT_EQ(flag, false);
 
     // enable and move clock
-    module.expiry_enabled=true;
-    module.whole_file_expiry=true;
-    module.expiry_minutes=1;
-    SetTimeMinutes(now + 120*port::UINT64_ONE_SECOND);
+    module.SetExpiryEnabled(true);
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(1);
+    SetCachedTimeMicros(now + 120*port::UINT64_ONE_SECOND_MICROS);
     ver.SetFileList(level, files);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
@@ -315,14 +344,14 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     file_ptr=new FileMetaData;
     file_ptr->smallest.SetFrom(ParsedInternalKey("GG1", 0, 5, kTypeValue));
     file_ptr->largest.SetFrom(ParsedInternalKey("HH1", 0, 6, kTypeValue));
-    file_ptr->exp_write_low=ULONG_MAX;  // sign of no aged expiry, or plain keys
-    file_ptr->exp_explicit_high=now + 60*port::UINT64_ONE_SECOND;
+    file_ptr->exp_write_low=ULLONG_MAX;  // sign of no aged expiry, or plain keys
+    file_ptr->exp_explicit_high=now + 60*port::UINT64_ONE_SECOND_MICROS;
     files.push_back(file_ptr);
 
     // disable
-    module.expiry_enabled=false;
-    module.whole_file_expiry=false;
-    module.expiry_minutes=0;
+    module.SetExpiryEnabled(false);
+    module.SetWholeFileExpiryEnabled(false);
+    module.SetExpiryMinutes(0);
     ver.SetFileList(level, files);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
@@ -330,9 +359,9 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     ASSERT_EQ(flag, false);
 
     // enable compaction expiry only
-    module.expiry_enabled=true;
-    module.whole_file_expiry=false;
-    module.expiry_minutes=1;
+    module.SetExpiryEnabled(true);
+    module.SetWholeFileExpiryEnabled(false);
+    module.SetExpiryMinutes(1);
     ver.SetFileList(level, files);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
@@ -340,8 +369,8 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     ASSERT_EQ(flag, false);
 
     // enable file expiry too
-    module.whole_file_expiry=true;
-    module.expiry_minutes=1;
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(1);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, true);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
@@ -349,8 +378,18 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
 
     // enable file, but not expiry minutes (disable)
     //   ... but file without aged expiries or plain keys
-    module.whole_file_expiry=true;
-    module.expiry_minutes=0;
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(0);
+    ver.SetFileList(level, files);
+    flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
+    ASSERT_EQ(flag, true);
+    flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
+    ASSERT_EQ(flag, true);
+
+    // enable file, minutes as unlimited
+    //   ... but file without aged expiries or plain keys
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryUnlimited(true);
     ver.SetFileList(level, files);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, true);
@@ -366,13 +405,13 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     file_ptr=new FileMetaData;
     file_ptr->smallest.SetFrom(ParsedInternalKey("II1", 0, 7, kTypeValue));
     file_ptr->largest.SetFrom(ParsedInternalKey("JJ1", 0, 8, kTypeValue));
-    file_ptr->exp_write_low=now - 60*port::UINT64_ONE_SECOND;
-    file_ptr->exp_write_high=now + 60*port::UINT64_ONE_SECOND;
+    file_ptr->exp_write_low=now - 60*port::UINT64_ONE_SECOND_MICROS;
+    file_ptr->exp_write_high=now + 60*port::UINT64_ONE_SECOND_MICROS;
     files.push_back(file_ptr);
 
     // disable
-    module.whole_file_expiry=false;
-    module.expiry_minutes=0;
+    module.SetWholeFileExpiryEnabled(false);
+    module.SetExpiryMinutes(0);
     ver.SetFileList(level, files);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
@@ -380,59 +419,67 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     ASSERT_EQ(flag, false);
 
     // enable compaction only
-    module.whole_file_expiry=false;
-    module.expiry_minutes=1;
+    module.SetWholeFileExpiryEnabled(false);
+    module.SetExpiryMinutes(1);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, false);
 
     // enable file too
-    module.whole_file_expiry=true;
-    module.expiry_minutes=1;
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(1);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, true);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, true);
 
     // enable file, but not expiry minutes (disable)
-    module.whole_file_expiry=true;
-    module.expiry_minutes=0;
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(0);
+    flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
+    ASSERT_EQ(flag, false);
+    flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
+    ASSERT_EQ(flag, false);
+
+    // enable file, but unlimited minutes
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryUnlimited(true);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, false);
 
     // file_ptr at 1min, setting at 5 min
-    module.whole_file_expiry=true;
-    module.expiry_minutes=5;
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(5);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, false);
 
     // file_ptr at 1min, setting at 1m, clock at 30 seconds
-    module.whole_file_expiry=true;
-    module.expiry_minutes=1;
-    SetTimeMinutes(now + 30*port::UINT64_ONE_SECOND);
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(1);
+    SetCachedTimeMicros(now + 30*port::UINT64_ONE_SECOND_MICROS);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, false);
 
     // file_ptr at 1min, setting at 1m, clock at 1.5minutes
-    module.whole_file_expiry=true;
-    module.expiry_minutes=1;
-    SetTimeMinutes(now + 90*port::UINT64_ONE_SECOND);
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(1);
+    SetCachedTimeMicros(now + 90*port::UINT64_ONE_SECOND_MICROS);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, false);
 
     // file_ptr at 1min, setting at 1m, clock at 2minutes
-    module.whole_file_expiry=true;
-    module.expiry_minutes=1;
-    SetTimeMinutes(now + 120*port::UINT64_ONE_SECOND);
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(1);
+    SetCachedTimeMicros(now + 120*port::UINT64_ONE_SECOND_MICROS);
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, true);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
@@ -440,7 +487,7 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
 
     // same settings, but show an explicit expiry too that has not
     //  expired
-    file_ptr->exp_explicit_high=now +240*port::UINT64_ONE_SECOND;
+    file_ptr->exp_explicit_high=now +240*port::UINT64_ONE_SECOND_MICROS;
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
@@ -448,7 +495,7 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
 
     // same settings, but show an explicit expiry has expired
     //  expired
-    file_ptr->exp_explicit_high=now +90*port::UINT64_ONE_SECOND;
+    file_ptr->exp_explicit_high=now +90*port::UINT64_ONE_SECOND_MICROS;
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, true);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
@@ -467,7 +514,7 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
 
     // same settings, explicit has expired, but not the aged
     //  expired
-    file_ptr->exp_write_high=now +240*port::UINT64_ONE_SECOND;
+    file_ptr->exp_write_high=now +240*port::UINT64_ONE_SECOND_MICROS;
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, false);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
@@ -475,13 +522,13 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
 
     // variations on Bug 1 test.  Put singleton expired file in
     //  first, second, then third position.  Other two no expiry
-    files[0]->exp_write_low=ULONG_MAX;  // sign of no aged expiry, or plain keys
+    files[0]->exp_write_low=ULLONG_MAX;  // sign of no aged expiry, or plain keys
     files[0]->exp_write_high=0;
-    files[0]->exp_explicit_high=now +90*port::UINT64_ONE_SECOND;
-    files[1]->exp_write_low=ULONG_MAX;  // sign of no aged expiry, or plain keys
+    files[0]->exp_explicit_high=now +90*port::UINT64_ONE_SECOND_MICROS;
+    files[1]->exp_write_low=ULLONG_MAX;  // sign of no aged expiry, or plain keys
     files[1]->exp_write_high=0;
     files[1]->exp_explicit_high=0;
-    files[2]->exp_write_low=ULONG_MAX;  // sign of no aged expiry, or plain keys
+    files[2]->exp_write_low=ULLONG_MAX;  // sign of no aged expiry, or plain keys
     files[2]->exp_write_high=0;
     files[2]->exp_explicit_high=0;
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
@@ -489,13 +536,13 @@ TEST(ExpiryTester, CompactionFinalizeCallback1)
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, true);
     files[0]->exp_explicit_high=0;
-    files[1]->exp_explicit_high=now +90*port::UINT64_ONE_SECOND;
+    files[1]->exp_explicit_high=now +90*port::UINT64_ONE_SECOND_MICROS;
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, true);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
     ASSERT_EQ(flag, true);
     files[1]->exp_explicit_high=0;
-    files[2]->exp_explicit_high=now +90*port::UINT64_ONE_SECOND;
+    files[2]->exp_explicit_high=now +90*port::UINT64_ONE_SECOND_MICROS;
     flag=module.CompactionFinalizeCallback(true, ver, level, NULL);
     ASSERT_EQ(flag, true);
     flag=module.CompactionFinalizeCallback(false, ver, level, NULL);
@@ -517,9 +564,9 @@ struct TestFileMetaData
     uint64_t m_Number;          // file number
     const char * m_Smallest;
     const char * m_Largest;
-    ExpiryTime m_Expiry1;              // minutes
-    ExpiryTime m_Expiry2;
-    ExpiryTime m_Expiry3;
+    ExpiryTimeMicros m_Expiry1;              // minutes
+    ExpiryTimeMicros m_Expiry2;
+    ExpiryTimeMicros m_Expiry3;
 };
 
 
@@ -545,10 +592,10 @@ CreateMetaArray(
     size_t loop;
     TestFileMetaData * cursor;
     FileMetaData * file_ptr;
-    ExpiryTime now;
+    ExpiryTimeMicros now;
 
     ClearMetaArray(Output);
-    now=GetTimeMinutes();
+    now=GetCachedTimeMicros();
 
     for (loop=0, cursor=Data; loop<Count; ++loop, ++cursor)
     {
@@ -558,7 +605,7 @@ CreateMetaArray(
         file_ptr->largest.SetFrom(ParsedInternalKey(cursor->m_Largest, 0, cursor->m_Number, kTypeValue));
         if (0!=cursor->m_Expiry1)
         {
-            if (ULONG_MAX!=cursor->m_Expiry1)
+            if (ULLONG_MAX!=cursor->m_Expiry1)
                 file_ptr->exp_write_low=now + cursor->m_Expiry1*60000000;
             else
                 file_ptr->exp_write_low=cursor->m_Expiry1;
@@ -594,13 +641,13 @@ TestFileMetaData levelB[]=
 TestFileMetaData levelC[]=
 {
     {200, "CA", "DA", 1, 3, 0},
-    {201, "SA", "TA", ULONG_MAX, 0, 4}
+    {201, "SA", "TA", ULLONG_MAX, 0, 4}
 };  // levelC
 
 TestFileMetaData levelD[]=
 {
     {200, "CA", "DA", 1, 2, 0},
-    {201, "SA", "TA", ULONG_MAX, 0, 2}
+    {201, "SA", "TA", ULLONG_MAX, 0, 2}
 };  // levelD
 
 
@@ -614,12 +661,12 @@ TEST(ExpiryTester, OverlapTests)
     const int overlap0(0), overlap1(1), sorted0(3), sorted1(4);
     VersionEdit edit;
 
-    module.expiry_enabled=true;
-    module.whole_file_expiry=true;
-    module.expiry_minutes=2;
+    module.SetExpiryEnabled(true);
+    module.SetWholeFileExpiryEnabled(true);
+    module.SetExpiryMinutes(2);
 
-    now=port::TimeUint64();
-    SetTimeMinutes(now);
+    now=port::TimeMicros();
+    SetCachedTimeMicros(now);
 
 
     /** case: two levels, no overlap, no expiry **/
@@ -650,10 +697,10 @@ TEST(ExpiryTester, OverlapTests)
     ver.SetFileList(sorted1, level_clear);
 
     /** case: two levels, 100% overlap, both levels expired **/
-    SetTimeMinutes(now);
+    SetCachedTimeMicros(now);
     CreateMetaArray(level1, levelC, 2);
     CreateMetaArray(level2, levelD, 2);
-    SetTimeMinutes(now + 5*60000000);
+    SetCachedTimeMicros(now + 5*60000000);
     ver.SetFileList(sorted0, level1);
     ver.SetFileList(sorted1, level2);
     flag=module.CompactionFinalizeCallback(true, ver, sorted0, &edit);
@@ -662,6 +709,14 @@ TEST(ExpiryTester, OverlapTests)
     flag=module.CompactionFinalizeCallback(true, ver, sorted1, &edit);
     ASSERT_EQ(flag, true);
     ASSERT_EQ(edit.DeletedFileCount(), 2);
+
+    // retest sorted1 with unlimited
+    module.SetExpiryUnlimited(true);
+    flag=module.CompactionFinalizeCallback(true, ver, sorted1, &edit);
+    ASSERT_EQ(flag, true);
+    ASSERT_EQ(edit.DeletedFileCount(), 2);
+
+    // cleanup
     ver.SetFileList(sorted0, level_clear);
     ver.SetFileList(sorted1, level_clear);
 
@@ -724,14 +779,14 @@ public:
     };  // OneCompaction
 
     void SetClock(uint64_t Time)
-        {SetTimeMinutes(Time);};
+        {SetCachedTimeMicros(Time);};
 
     void ShiftClockMinutes(int Min)
     {
         uint64_t shift;
 
-        shift=Min * 60 * port::UINT64_ONE_SECOND;
-        SetTimeMinutes(GetTimeMinutes() + shift);
+        shift=Min * 60 * port::UINT64_ONE_SECOND_MICROS;
+        SetCachedTimeMicros(GetCachedTimeMicros() + shift);
     };
 };  // class ExpDB
 
@@ -781,7 +836,7 @@ class ExpiryManifestTester
 public:
     ExpiryManifestTester()
         : m_Good(false), m_DB(NULL), m_Env(Env::Default()),
-          m_BaseTime(port::TimeUint64()), m_Sequence(1)
+          m_BaseTime(port::TimeMicros()), m_Sequence(1)
     {
         m_DBName = test::TmpDir() + "/expiry";
 
@@ -790,8 +845,13 @@ public:
 
         m_Options.create_if_missing=true;
         m_Options.error_if_exists=false;
+
+        // Note: m_Options.expiry_module is a smart pointer.  It
+        //  owns the m_Expiry object and will automatically delete the
+        //  allocation.
         m_Expiry=new ExpTestModule;
         m_Options.expiry_module=m_Expiry;
+        m_Expiry->SetExpiryEnabled(true);
 
         OpenTestDB();
     };
@@ -826,7 +886,7 @@ public:
 
     void CreateKey(const sExpiryTestKey & Key, InternalKey & Output)
     {
-        ExpiryTime expiry;
+        ExpiryTimeMicros expiry;
         ValueType type;
 
         switch(Key.m_Type)
@@ -837,12 +897,12 @@ public:
                 break;
 
             case(eEXPIRY_AGED):
-                expiry=m_BaseTime - Key.m_NowMinus * 60 * port::UINT64_ONE_SECOND;
+                expiry=m_BaseTime - Key.m_NowMinus * 60 * port::UINT64_ONE_SECOND_MICROS;
                 type=kTypeValueWriteTime;
                 break;
 
             case(eEXPIRY_EXPLICIT):
-                expiry=m_BaseTime + Key.m_NowMinus * 60 * port::UINT64_ONE_SECOND;
+                expiry=m_BaseTime + Key.m_NowMinus * 60 * port::UINT64_ONE_SECOND_MICROS;
                 type=kTypeValueExplicitExpiry;
                 break;
         }   // switch
@@ -959,7 +1019,7 @@ public:
                                                          (*it)->largest.internal_key()));
 
             // create our idea of the expiry settings
-            exp_write_low=ULONG_MAX;
+            exp_write_low=ULLONG_MAX;
             exp_write_high=0;
             exp_explicit_high=0;
 
@@ -972,7 +1032,7 @@ public:
                         break;
 
                     case eEXPIRY_AGED:
-                        expires=m_BaseTime - cursor->m_Keys[loop1].m_NowMinus * 60 * port::UINT64_ONE_SECOND;
+                        expires=m_BaseTime - cursor->m_Keys[loop1].m_NowMinus * 60 * port::UINT64_ONE_SECOND_MICROS;
                         if (expires<exp_write_low)
                             exp_write_low=expires;
                         if (exp_write_high<expires)
@@ -980,7 +1040,7 @@ public:
                         break;
 
                     case eEXPIRY_EXPLICIT:
-                        expires=m_BaseTime + cursor->m_Keys[loop1].m_NowMinus * 60 * port::UINT64_ONE_SECOND;
+                        expires=m_BaseTime + cursor->m_Keys[loop1].m_NowMinus * 60 * port::UINT64_ONE_SECOND_MICROS;
                         if (exp_explicit_high<expires)
                             exp_explicit_high=expires;
                         break;
@@ -1058,7 +1118,7 @@ public:
         {
 
             if ( (eEXPIRY_EXPLICIT == cursor->m_Type && Minutes <= cursor->m_NowMinus)
-                 || (eEXPIRY_AGED == cursor->m_Type && Minutes<m_Expiry->expiry_minutes))
+                 || (eEXPIRY_AGED == cursor->m_Type && Minutes<m_Expiry->GetExpiryMinutes()))
             {
                 ASSERT_TRUE(it->Valid());
                 ASSERT_TRUE(0==strcmp(cursor->m_Key, it->key().ToString().c_str()));
@@ -1185,10 +1245,14 @@ TEST(ExpiryManifestTester, Overlap1)
     VerifyManifest(Overlap1, manifest_count);
     VerifyFiles(Overlap1, manifest_count, 0);
 
-    // enable compaction expiry
-    m_Expiry->expiry_enabled=true;
-    m_Expiry->expiry_minutes=60;
-    m_Expiry->whole_file_expiry=true;
+
+    // fully enable compaction expiry
+    m_Expiry->SetExpiryEnabled(false);
+    ASSERT_EQ(m_Options.ExpiryActivated(), false);
+    m_Expiry->SetExpiryEnabled(true);
+    m_Expiry->SetExpiryMinutes(60);
+    m_Expiry->SetWholeFileExpiryEnabled(true);
+    ASSERT_EQ(m_Options.ExpiryActivated(), true);
 
     m_DB->ShiftClockMinutes(10);
     m_Expiry->m_ExpiryAllow=1;
@@ -1242,9 +1306,9 @@ TEST(ExpiryManifestTester, Overlap2)
     VerifyFiles(Overlap1, manifest_count, 0);
 
     // enable compaction expiry
-    m_Expiry->expiry_enabled=true;
-    m_Expiry->expiry_minutes=60;
-    m_Expiry->whole_file_expiry=true;
+    m_Expiry->SetExpiryEnabled(true);
+    m_Expiry->SetExpiryMinutes(60);
+    m_Expiry->SetWholeFileExpiryEnabled(true);
     m_DB->ShiftClockMinutes(61);
 
     m_Expiry->m_ExpiryAllow=10;
@@ -1252,7 +1316,8 @@ TEST(ExpiryManifestTester, Overlap2)
 
     // let multiple threads complete
     /// sleep(1) required for Smart OS 1.8 buildbot
-    sleep(1);
+    ///  then rased to sleep(2) for freebsd buildbot
+    sleep(2);
     VerifyFiles(Overlap1, manifest_count, 5);
 
     return;
@@ -1290,13 +1355,13 @@ TEST(ExpiryManifestTester, Compact1)
     WriteBatch batch;
     KeyMetaData meta;
     int loop;
-    ExpiryTime expiry;
+    ExpiryTimeMicros expiry;
     ValueType type;
 
     // enable compaction expiry
-    m_Expiry->expiry_enabled=true;
-    m_Expiry->expiry_minutes=30;
-    m_Expiry->whole_file_expiry=false;
+    m_Expiry->SetExpiryEnabled(true);
+    m_Expiry->SetExpiryMinutes(30);
+    m_Expiry->SetWholeFileExpiryEnabled(false);
 
     key_count=sizeof(Compact1) / sizeof(Compact1[0]);
 
@@ -1310,12 +1375,12 @@ TEST(ExpiryManifestTester, Compact1)
                 break;
 
             case(eEXPIRY_AGED):
-                expiry=m_BaseTime - Key->m_NowMinus * 60 * port::UINT64_ONE_SECOND;
+                expiry=m_BaseTime - Key->m_NowMinus * 60 * port::UINT64_ONE_SECOND_MICROS;
                 type=kTypeValueWriteTime;
                 break;
 
             case(eEXPIRY_EXPLICIT):
-                expiry=m_BaseTime + Key->m_NowMinus * 60 * port::UINT64_ONE_SECOND;
+                expiry=m_BaseTime + Key->m_NowMinus * 60 * port::UINT64_ONE_SECOND_MICROS;
                 type=kTypeValueExplicitExpiry;
                 break;
         }   // switch
@@ -1347,6 +1412,247 @@ TEST(ExpiryManifestTester, Compact1)
     VerifyKeys(Compact1, key_count, 71);
 
 }   // Compact1
+
+
+struct sExpiryDBObject
+{
+    const char * m_Key;   // string key
+    const char * m_Value; // string value
+    int m_NowMinus;       // expiry time to set
+};
+
+
+class ExpiryDBTester
+{
+public:
+    ExpiryDBTester()
+        : m_Good(false), m_DB(NULL),
+          m_BaseTime(port::TimeMicros())
+    {
+        m_DBName = test::TmpDir() + "/expiry";
+
+        // clean up previous execution
+        leveldb::DestroyDB(m_DBName, m_Options);
+
+        m_Options.create_if_missing=true;
+        m_Options.error_if_exists=false;
+
+        // Note: m_Options.expiry_module is a smart pointer.  It
+        //  owns the m_Expiry object and will automatically delete the
+        //  allocation.
+        m_Expiry=new leveldb::ExpiryModuleOS;
+        m_Options.expiry_module=m_Expiry;
+
+        OpenTestDB();
+    };
+
+    ~ExpiryDBTester()
+    {
+        // clean up
+        delete m_DB;
+        leveldb::DestroyDB(m_DBName, m_Options);
+    };
+
+    void OpenTestDB()
+    {
+        leveldb::Status status;
+
+        status=leveldb::DB::Open(m_Options, m_DBName, (DB**)&m_DB);
+
+        m_Good=status.ok();
+        ASSERT_OK(status);
+        m_DB->SetClock(m_BaseTime);
+    }   // OpenTestDB
+
+protected:
+    bool m_Good;
+    std::string m_DBName;
+    Options m_Options;
+    leveldb::ExpiryModuleOS * m_Expiry;
+    ExpDB * m_DB;
+    uint64_t m_BaseTime;
+
+};  // ExpiryDBTester
+
+
+sExpiryDBObject SimpleData[]=
+{
+    {"aa", "one", 0},
+    {"bb", "two", 0},
+    {"cc", "three", 0},
+    {"dd", "four", 0},
+    {"ee", "five", 0}
+};
+
+
+/*
+ * Do simple writes, see if data disappears
+ *
+ */
+TEST(ExpiryDBTester, Simple)
+{
+    size_t obj_count, loop;
+    Status s;
+    sExpiryDBObject * cursor;
+    std::string buffer;
+    std::auto_ptr<leveldb::Iterator> iterator;
+
+    // enable compaction expiry
+    m_Expiry->SetExpiryEnabled(true);
+    m_Expiry->SetExpiryMinutes(2);
+    m_Expiry->SetWholeFileExpiryEnabled(false);
+
+    obj_count=sizeof(SimpleData) / sizeof(SimpleData[0]);
+
+    // load data (now in memory buffer)
+    for (loop=0, cursor=SimpleData; loop<obj_count; ++loop, ++cursor)
+    {
+        s=m_DB->Put(WriteOptions(), cursor->m_Key, cursor->m_Value);
+        ASSERT_OK(s);
+    }   // for
+
+    // verify we can find it
+    for (loop=0, cursor=SimpleData; loop<obj_count; ++loop, ++cursor)
+    {
+        s=m_DB->Get(ReadOptions(), cursor->m_Key, &buffer);
+        ASSERT_OK(s);
+    }   // for
+
+    // verify we can walk it
+    iterator.reset(m_DB->NewIterator(ReadOptions()));
+    for (loop=0, iterator->SeekToFirst(); loop<obj_count; ++loop, iterator->Next())
+    {
+        ASSERT_EQ(iterator->Valid(), true);
+    }   // for
+    ASSERT_EQ(iterator->Valid(), false);
+
+    // expiry set to 2 min, so shift 10
+    m_DB->ShiftClockMinutes(10);
+
+    // all data gone?
+    for (loop=0, cursor=SimpleData; loop<obj_count; ++loop, ++cursor)
+    {
+        s=m_DB->Get(ReadOptions(), cursor->m_Key, &buffer);
+        ASSERT_TRUE(s.IsNotFound());
+    }   // for
+
+    // make it reappear
+    m_Expiry->SetExpiryUnlimited(true);
+    for (loop=0, cursor=SimpleData; loop<obj_count; ++loop, ++cursor)
+    {
+        s=m_DB->Get(ReadOptions(), cursor->m_Key, &buffer);
+        ASSERT_OK(s);
+    }   // for
+
+    m_Expiry->SetExpiryMinutes(2);
+    iterator.reset(m_DB->NewIterator(ReadOptions()));
+    iterator->SeekToFirst();
+    ASSERT_EQ(iterator->Valid(), false);
+
+    // force data from memory buffer to .sst file
+    //  (after shifting clock!!)
+    m_DB->SetClock(m_BaseTime);
+    m_DB->CompactRange(NULL, NULL);
+
+    // verify we can find it
+    for (loop=0, cursor=SimpleData; loop<obj_count; ++loop, ++cursor)
+    {
+        s=m_DB->Get(ReadOptions(), cursor->m_Key, &buffer);
+        ASSERT_OK(s);
+    }   // for
+
+    // verify we can walk it
+    iterator.reset(m_DB->NewIterator(ReadOptions()));
+    for (loop=0, iterator->SeekToFirst(); loop<obj_count; ++loop, iterator->Next())
+    {
+        ASSERT_EQ(iterator->Valid(), true);
+    }   // for
+    ASSERT_EQ(iterator->Valid(), false);
+
+    // expiry set to 2 min, so shift 10
+    m_DB->ShiftClockMinutes(10);
+
+    // all data gone?
+    for (loop=0, cursor=SimpleData; loop<obj_count; ++loop, ++cursor)
+    {
+        s=m_DB->Get(ReadOptions(), cursor->m_Key, &buffer);
+        ASSERT_TRUE(s.IsNotFound());
+    }   // for
+
+    iterator.reset(m_DB->NewIterator(ReadOptions()));
+    iterator->SeekToFirst();
+    ASSERT_EQ(iterator->Valid(), false);
+
+
+    // run compaction again with clock advanced
+    //  to physically remove records.  Then move
+    //  clock to starting time and prove records gone gone.
+    ///  (note that we "know" .sst file is on level 3)
+    m_DB->TEST_CompactRange(3, NULL, NULL);
+    m_DB->SetClock(m_BaseTime);
+
+    // all data gone?
+    for (loop=0, cursor=SimpleData; loop<obj_count; ++loop, ++cursor)
+    {
+        s=m_DB->Get(ReadOptions(), cursor->m_Key, &buffer);
+        ASSERT_TRUE(s.IsNotFound());
+    }   // for
+
+    iterator.reset(m_DB->NewIterator(ReadOptions()));
+    iterator->SeekToFirst();
+    ASSERT_EQ(iterator->Valid(), false);
+
+}   // ExpiryDBTester::Simple
+
+
+/**
+ * Riak uses a special key to mark a "feature upgrade".  That
+ *  key must never expire.
+ */
+// from riak_kv_eleveldb_backend.erl:  sext:encode({md,fixed_indexes}).
+static const char * MDKey=
+{"\x10\x00\x00\x00\x02\x0c\xb6\xd9\x00\x08\x0c\xb3\x5a\x6f\x16\x5b\x25\x7e\xd3\x6e\xb2\x59\x64\x16\x5b\x98\x08"};
+static const int MDKeyLen=27;
+
+// example Riak key:  sext:encode({o,{<<bob1>>,<<buck1>>,<<key0>>}).
+static const char * RiakKey=
+{"\x10\x00\x00\x00\x03\x0c\xb7\x80\x08\x10\x00\x00\x00\x02\x12\xb1\x5b\xec\x53\x10\x08\x12\xb1\x5d\x6c\x76\xb9\x88\x08\x12\xb5\xd9\x6f\x33\x10\x08"};
+static const int RiakKeyLen=36;
+
+TEST(ExpiryDBTester, MetaDataKey)
+{
+    Slice key_md(MDKey, MDKeyLen);
+    Slice key_riak(RiakKey, RiakKeyLen);
+    Slice no_value;
+    std::string return_value;
+    KeyMetaData meta;
+    Status s;
+
+    // enable expiry
+    m_Expiry->SetExpiryEnabled(true);
+    m_Expiry->SetExpiryMinutes(2);
+    m_Expiry->SetWholeFileExpiryEnabled(false);
+
+    // write special key that should not receive expiry
+    s=m_DB->Put(WriteOptions(), key_md, no_value);
+    ASSERT_OK(s);
+
+    // verify
+    s=m_DB->Get(ReadOptions(), key_md, &return_value, &meta);
+    ASSERT_OK(s);
+    ASSERT_EQ(meta.m_Type, kTypeValue);
+
+    // write a normal key that SHOULD get expiry
+    s=m_DB->Put(WriteOptions(), key_riak, no_value);
+    ASSERT_OK(s);
+
+    // verify
+    s=m_DB->Get(ReadOptions(), key_riak, &return_value, &meta);
+    ASSERT_OK(s);
+    ASSERT_EQ(meta.m_Type, kTypeValueWriteTime);
+
+}   // ExpiryDBTester, MetaDataKey
+
 
 
 }  // namespace leveldb

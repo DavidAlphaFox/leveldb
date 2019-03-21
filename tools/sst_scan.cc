@@ -1,5 +1,28 @@
+// -------------------------------------------------------------------
+//
+// sst_scan.cc
+//
+// Copyright (c) 2016 Basho Technologies, Inc. All Rights Reserved.
+//
+// This file is provided to you under the Apache License,
+// Version 2.0 (the "License"); you may not use this file
+// except in compliance with the License.  You may obtain
+// a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+// -------------------------------------------------------------------
+
 #include <stdlib.h>
 #include <libgen.h>
+#include <arpa/inet.h>
 
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
@@ -17,10 +40,15 @@
 #include "table/filter_block.h"
 #include "util/cache2.h"
 
+//#include "leveldb_ee/riak_object.h"
+
 //#include "util/logging.h"
 //#include "db/log_reader.h"
 
 void command_help();
+bool PrintSextKey(leveldb::Slice & Cursor, int Limit=1);
+bool PrintSextAtom(leveldb::Slice & Cursor);
+void PrintInternalKeyInfo(leveldb::ParsedInternalKey & ParsedKey);
 
 int
 main(
@@ -28,7 +56,7 @@ main(
     char ** argv)
 {
     bool error_seen, index_keys, all_keys, block_info, csv_header, counter_info,
-        running, no_csv, summary_only;
+        running, no_csv, summary_only, riak_translations, value_dump;
     int error_counter;
     char ** cursor;
 
@@ -42,6 +70,8 @@ main(
     all_keys=false;
     no_csv=false;
     summary_only=false;
+    riak_translations=false;
+    value_dump=false;
 
     error_counter=0;
 
@@ -62,7 +92,9 @@ main(
                 case 'i':  index_keys=true; break;
                 case 'k':  all_keys=true; break;
                 case 'n':  no_csv=true; break;
+                case 'r':  riak_translations=true; break;
                 case 's':  summary_only=true; break;
+                case 'v':  all_keys=true; value_dump=true; break;
                 default:
                     fprintf(stderr, " option \'%c\' is not valid\n", flag);
                     command_help();
@@ -135,6 +167,7 @@ main(
                     tot_size=0;
 
                     table = reinterpret_cast<leveldb::TableAndFile*>(table_cache->TEST_GetInternalCache()->Value(fhandle))->table;
+                    table->ReadFilter();
                     file = reinterpret_cast<leveldb::TableAndFile*>(table_cache->TEST_GetInternalCache()->Value(fhandle))->file;
                     it = table->TEST_GetIndexBlock()->NewIterator(options.comparator);
 
@@ -230,6 +263,26 @@ main(
 
                                     ParseInternalKey(key, &parsed);
                                     printf("%s block_key %s\n", parsed.DebugStringHex().c_str(), table_name.c_str());
+
+                                    if (riak_translations && '\x10'==*parsed.user_key.data())
+                                    {
+                                        leveldb::Slice cursor_slice;
+
+                                        cursor_slice=parsed.user_key;
+                                        printf("     ");
+                                        PrintSextKey(cursor_slice);
+                                        printf("\n");
+                                        printf("     ");
+                                        PrintInternalKeyInfo(parsed);
+                                        printf("\n");
+
+                                        cursor_slice=parsed.user_key;
+                                    }   // if
+
+                                    if (value_dump)
+                                    {
+                                        printf("  %s\n", HexString(it2->value()).c_str());
+                                    }   // if
                                 }   // if
                             }   // if
                             else
@@ -328,7 +381,180 @@ command_help()
     fprintf(stderr, "      -i  print index keys\n");
     fprintf(stderr, "      -k  print all keys\n");
     fprintf(stderr, "      -n  NO csv data (or header)\n");
+    fprintf(stderr, "      -r  print riak translations\n");
+    fprintf(stderr, "      -v  print all keys and their values\n");
+
 }   // command_help
+
+
+/**
+ * Recursive routine to give idea of key contents
+ */
+bool
+PrintSextKey(
+    leveldb::Slice & Cursor,
+    int Limit)
+{
+    int loop;
+    bool good(true);
+
+    for (loop=0; loop<Limit && good; ++loop)
+    {
+        if (0<loop)
+            printf(",");
+
+        switch(*Cursor.data())
+        {
+            case(16):   // tuple
+            {
+                uint32_t count;
+
+                Cursor.remove_prefix(1);
+                count=ntohl(*(uint32_t*)Cursor.data());
+                Cursor.remove_prefix(4);
+
+                printf("{");
+                good=PrintSextKey(Cursor, count);
+                printf("}");
+                break;
+            }   // tuple
+
+            case(12):   // atom
+            {
+                Cursor.remove_prefix(1);
+                good=PrintSextAtom(Cursor);
+                break;
+            }   // atom
+
+            case(18):   // binary
+            {
+                Cursor.remove_prefix(1);
+                printf("<<");
+                good=PrintSextAtom(Cursor);
+                printf(">>");
+                break;
+            }   // atom
+        }   // switch
+    }   // for
+
+    return(good);
+
+}   // PrintSextKey
+
+
+bool
+PrintSextAtom(
+    leveldb::Slice & Cursor)
+{
+    bool good(true);
+    uint8_t mask(0x80);
+    char output;
+
+    while(good && (uint8_t)*Cursor.data() & mask)
+    {
+        // this could be done easier with variables instead of fixed constants
+        switch(mask)
+        {
+            case(0x80):
+            {
+                output=(*Cursor.data() & 0x7f) << 1;
+                Cursor.remove_prefix(1);
+                output+=(*Cursor.data() & 0x80) >> 7;
+                printf("%c",output);
+                mask=0x40;
+                break;
+            }
+
+            case(0x40):
+            {
+                output=(*Cursor.data() & 0x3f) << 2;
+                Cursor.remove_prefix(1);
+                output+=(*Cursor.data() & 0xc0) >> 6;
+                printf("%c",output);
+                mask=0x20;
+                break;
+            }
+
+            case(0x20):
+            {
+                output=(*Cursor.data() & 0x1f) << 3;
+                Cursor.remove_prefix(1);
+                output+=(*Cursor.data() & 0xe0) >> 5;
+                printf("%c",output);
+                mask=0x10;
+                break;
+            }
+
+            case(0x10):
+            {
+                output=(*Cursor.data() & 0x0f) << 4;
+                Cursor.remove_prefix(1);
+                output+=(*Cursor.data() & 0xf0) >> 4;
+                printf("%c",output);
+                mask=0x08;
+                break;
+            }
+
+            case(0x08):
+            {
+                output=(*Cursor.data() & 0x07) << 5;
+                Cursor.remove_prefix(1);
+                output+=(*Cursor.data() & 0xf8) >> 3;
+                printf("%c",output);
+                mask=0x04;
+                break;
+            }
+
+            case(0x04):
+            {
+                output=(*Cursor.data() & 0x03) << 6;
+                Cursor.remove_prefix(1);
+                output+=(*Cursor.data() & 0xfc) >> 2;
+                printf("%c",output);
+                mask=0x02;
+                break;
+            }
+
+            case(0x02):
+            {
+                output=(*Cursor.data() & 0x01) << 7;
+                Cursor.remove_prefix(1);
+                output+=(*Cursor.data() & 0xfe) >> 1;
+                printf("%c",output);
+                mask=0x01;
+                break;
+            }
+
+            case(0x01):
+            {
+                Cursor.remove_prefix(1);
+                output=*Cursor.data();
+                Cursor.remove_prefix(1);
+                printf("%c",output);
+                mask=0x80;
+                break;
+            }
+        }   // switch
+
+    }   // while
+
+    Cursor.remove_prefix(2);
+
+    return(good);
+
+}   // PrintSextAtom
+
+
+void
+PrintInternalKeyInfo(
+    leveldb::ParsedInternalKey & ParsedKey)
+{
+    printf("%s, seq: %" PRIu64, leveldb::KeyTypeString(ParsedKey.type), ParsedKey.sequence);
+
+    if (leveldb::IsExpiryKey(ParsedKey.type))
+        printf(", expiry: %" PRIu64, ParsedKey.expiry);
+
+}   // PrintInternalKeyInfo
 
 namespace leveldb {
 
