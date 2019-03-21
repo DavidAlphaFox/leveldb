@@ -105,11 +105,36 @@ std::string OldInfoLogFileName(const std::string& dbname) {
   return dbname + "/LOG.old";
 }
 
-// not putting this in ParseFileName since long term
-//  intend to merge this data into manifest.
+//
 std::string CowFileName(const std::string& dbname) {
   return dbname + "/COW";
 }
+
+
+// Append appropriate "backup" string to input path
+std::string BackupPath(const std::string& dbname, int backup_num) {
+    std::string dirname;
+
+  char buf[100];
+  if (0 != backup_num)
+      snprintf(buf, sizeof(buf), "/backup.%-d", backup_num);
+  else
+      snprintf(buf, sizeof(buf), "/backup");
+
+  return(dbname + buf);
+}
+
+
+// update tiered_fast_prefix and tiered_slow_prefix members of
+//  given Options object to point to desired backup path
+bool SetBackupPaths(Options & options, int backup_num) {
+
+    options.tiered_fast_prefix = BackupPath(options.tiered_fast_prefix, backup_num);
+    options.tiered_slow_prefix = BackupPath(options.tiered_slow_prefix, backup_num);
+
+    return(true);
+}
+
 
 // Owned filenames have the form:
 //    dbname/CURRENT
@@ -118,6 +143,7 @@ std::string CowFileName(const std::string& dbname) {
 //    dbname/LOG.old
 //    dbname/MANIFEST-[0-9]+
 //    dbname/[0-9]+.(log|sst)
+//    dbname/COW
 bool ParseFileName(const std::string& fname,
                    uint64_t* number,
                    FileType* type) {
@@ -125,6 +151,9 @@ bool ParseFileName(const std::string& fname,
   if (rest == "CURRENT") {
     *number = 0;
     *type = kCurrentFile;
+  } else if (rest == "COW") {
+    *number = 0;
+    *type = kCacheWarming;
   } else if (rest == "LOCK") {
     *number = 0;
     *type = kDBLockFile;
@@ -252,7 +281,12 @@ MakeTieredDbname(
     const std::string & dbname,    // input ... original dbname from DBImpl constructor
     Options & options)             // input/output ... writable Options, tiered values changed
 {
-    if (0<(int)options.tiered_slow_level && (int)options.tiered_slow_level<config::kNumLevels
+    // case for "", used with internal calls to DestroyDB
+    if (0==dbname.size() && 0!=options.tiered_fast_prefix.size())
+    {
+        // do NOTHING ... options already initialized
+    }   // if
+    else if (0<(int)options.tiered_slow_level && (int)options.tiered_slow_level<config::kNumLevels
         && 0!=options.tiered_fast_prefix.size() && 0!=options.tiered_slow_prefix.size())
     {
         options.tiered_fast_prefix.append("/");
@@ -260,7 +294,7 @@ MakeTieredDbname(
 
         options.tiered_slow_prefix.append("/");
         options.tiered_slow_prefix.append(dbname);
-    }
+    }   // else if
     else
     {
         options.tiered_slow_level=0;

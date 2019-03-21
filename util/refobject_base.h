@@ -30,7 +30,9 @@
 
 #include <stdint.h>
 
+#include "port/port.h"
 #include "leveldb/atomics.h"
+#include "util/mutexlock.h"
 
 namespace leveldb {
 
@@ -51,16 +53,17 @@ namespace leveldb {
  */
 class RefObjectBase
 {
- protected:
+    // force this private so everyone is using memory fenced GetRefCount
+ private:
     volatile uint32_t m_RefCount;
 
  public:
     RefObjectBase() : m_RefCount(0) {}
     virtual ~RefObjectBase() {}
 
-    uint32_t RefInc() {return(inc_and_fetch(&m_RefCount));}
+    virtual uint32_t RefInc() {return(inc_and_fetch(&m_RefCount));}
 
-    uint32_t RefDec()
+    virtual uint32_t RefDec()
     {
         uint32_t current_refs;
 
@@ -70,7 +73,13 @@ class RefObjectBase
         }
 
         return(current_refs);
-    }
+    }   // RefDec
+
+    // some derived objects might need other cleanup before delete (see ErlRefObject)
+    virtual uint32_t RefDecNoDelete() {return(dec_and_fetch(&m_RefCount));};
+
+    // establish memory fence via atomic operation call
+    virtual uint32_t GetRefCount() {return(add_and_fetch(&m_RefCount, (uint32_t)0));};
 
  private:
     // hide the copy ctor and assignment operator (not implemented)
@@ -87,6 +96,7 @@ template<typename Object> class RefPtr
 public:
 
 protected:
+    port::Spin m_Spin;
     Object * m_Ptr;            // NULL or object being reference counted
 
 private:
@@ -118,6 +128,7 @@ public:
 
     void reset(Object * ObjectPtr=NULL)
     {
+        SpinLock l(&m_Spin);
         Object * old_ptr;
 
         // increment new before decrement old in case

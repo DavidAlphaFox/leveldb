@@ -2,7 +2,7 @@
 //
 // throttle.cc
 //
-// Copyright (c) 2011-2015 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2011-2017 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -31,7 +31,11 @@
 #include "util/db_list.h"
 #include "util/flexcache.h"
 #include "util/hot_threads.h"
+#include "util/thread_tasks.h"
 #include "util/throttle.h"
+
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 
 namespace leveldb {
 
@@ -126,7 +130,7 @@ ThrottleThread(
     {
         // update our global clock, not intended to be a precise
         //  60 second interval.
-        gCurrentTime=port::TimeUint64();
+        gCurrentTime=port::TimeMicros();
 
         //
         // This is code polls for existance of /etc/riak/perf_counters and sets
@@ -234,15 +238,24 @@ ThrottleThread(
             }   // else
 
             // change the throttle slowly
-            if (gThrottleRate < new_throttle)
-                gThrottleRate+=(new_throttle - gThrottleRate)/THROTTLE_SCALING;
+            //  (+1 & +2 keep throttle moving toward goal when difference new and
+            //   old is less than THROTTLE_SCALING)
+            int temp_rate;
+
+            temp_rate=gThrottleRate;
+            if (temp_rate < new_throttle)
+                temp_rate+=(new_throttle - temp_rate)/THROTTLE_SCALING +1;
             else
-                gThrottleRate-=(gThrottleRate - new_throttle)/THROTTLE_SCALING;
+                temp_rate-=(temp_rate - new_throttle)/THROTTLE_SCALING +2;
 
-            if (0==gThrottleRate)
-                gThrottleRate=1;   // throttle must always have an effect
+            // +2 can make this go negative
+            if (temp_rate<1)
+                temp_rate=1;   // throttle must always have an effect
 
+            gThrottleRate=temp_rate;
             gUnadjustedThrottleRate=new_unadjusted;
+
+	    // Log(NULL, "ThrottleRate %" PRIu64 ", UnadjustedThrottleRate %" PRIu64, gThrottleRate, gUnadjustedThrottleRate);
 
             gPerfCounters->Set(ePerfThrottleGauge, gThrottleRate);
             gPerfCounters->Add(ePerfThrottleCounter, gThrottleRate*THROTTLE_SECONDS);
@@ -263,15 +276,21 @@ ThrottleThread(
         if (cache_expire < now_seconds)
         {
             cache_expire = now_seconds + 60*60;  // hard coded to one hour for now
-            DBList()->ScanDBs(true,&DBImpl::PurgeExpiredFileCache);
+            DBList()->ScanDBs(true,  &DBImpl::PurgeExpiredFileCache);
             DBList()->ScanDBs(false, &DBImpl::PurgeExpiredFileCache);
         }   // if
+
+        //
+        // This is a second non-throttle task added to this one minute loop.  Pattern forming.
+        //  See if hot backup wants to initiate.
+        //
+	CheckHotBackupTrigger();
 
         // nudge compaction logic of potential grooming
         if (0==gCompactionThreads->m_WorkQueueAtomic)  // user databases
             DBList()->ScanDBs(false, &DBImpl::CheckAvailableCompactions);
         if (0==gCompactionThreads->m_WorkQueueAtomic)  // internal databases
-            DBList()->ScanDBs(true, &DBImpl::CheckAvailableCompactions);
+            DBList()->ScanDBs(true,  &DBImpl::CheckAvailableCompactions);
 
     }   // while
 
@@ -323,8 +342,8 @@ uint64_t GetThrottleWriteRate() {return(gThrottleRate);};
 uint64_t GetUnadjustedThrottleWriteRate() {return(gUnadjustedThrottleRate);};
 
 // clock_gettime but only updated once every 60 seconds (roughly)
-uint64_t GetTimeMinutes() {return(gCurrentTime);};
-void SetTimeMinutes(uint64_t Time) {gCurrentTime=Time;};
+uint64_t GetCachedTimeMicros() {return(gCurrentTime);};
+void SetCachedTimeMicros(uint64_t Time) {gCurrentTime=Time;};
 /**
  * ThrottleStopThreads() is the first step in a two step shutdown.
  * This stops the 1 minute throttle calculation loop that also

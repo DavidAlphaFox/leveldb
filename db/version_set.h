@@ -105,13 +105,13 @@ class Version {
                                  const Slice& largest_user_key,
                                  const int level_limit);
 
-  size_t NumFiles(int level) const { return files_[level].size(); }
+  virtual size_t NumFiles(int level) const { return files_[level].size(); }
 
   const VersionSet * GetVersionSet() const { return vset_; }
 
   typedef std::vector<FileMetaData*> FileMetaDataVector_t;
 
-  const std::vector<FileMetaData*> & GetFileList(int level) const {return files_[level];};
+  virtual const std::vector<FileMetaData*> & GetFileList(int level) const {return files_[level];};
 
   volatile int WritePenalty() const {return write_penalty_; }
 
@@ -166,7 +166,7 @@ protected:
   {
   }
 
-  ~Version();
+  virtual ~Version();
 
 private:
   // No copying allowed
@@ -219,7 +219,9 @@ class VersionSet {
   // is the specified level overlapped (or if false->sorted)
   static bool IsLevelOverlapped(int level);
 
-  uint64_t MaxFileSizeForLevel(int level) const;
+  static uint64_t DesiredBytesForLevel(int level);
+  static uint64_t MaxBytesForLevel(int level);
+  static uint64_t MaxFileSizeForLevel(int level);
 
   // Return the combined file size of all files at the specified level.
   int64_t NumLevelBytes(int level) const;
@@ -256,7 +258,7 @@ class VersionSet {
           ret_val=(int)throttle;
       else if (0!=penalty)
       {
-          if (throttle<GetUnadjustedThrottleWriteRate())
+          if (1==throttle)
               throttle=GetUnadjustedThrottleWriteRate();
           ret_val=(int)penalty * throttle;
       }   // else if
@@ -374,7 +376,6 @@ protected:
   uint64_t last_sequence_;
   uint64_t log_number_;
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
-  uint64_t write_rate_usec_;   // most recent average rate per key
 
   // Opened lazily
   WritableFile* descriptor_file_;
@@ -389,6 +390,11 @@ protected:
   // Riak allows multiple compaction threads, this mutex allows
   //  only one to write to manifest at a time.  Only used in LogAndApply
   port::Mutex manifest_mutex_;
+
+  volatile uint64_t last_penalty_minutes_;
+  volatile int prev_write_penalty_;
+
+
 
   struct CompactionStatus_s
   {
